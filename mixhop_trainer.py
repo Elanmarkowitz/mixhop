@@ -19,7 +19,7 @@ import mixhop_model
 
 # IO Flags.
 flags.DEFINE_string('dataset_dir',
-                    os.path.join(os.environ['HOME'], 'data/planetoid/data'),
+                    'data/planetoid/data',
                     'Directory containing all datasets. We assume the format '
                     'of Planetoid')
 flags.DEFINE_string('results_dir', 'results',
@@ -83,6 +83,12 @@ flags.DEFINE_float('lr_decrement_ratio_of_initial', 0.01,
                    'this value * --learn_rate.')
 flags.DEFINE_float('lr_decrement_every', 40,
                    'Learning rate will be decremented every this many steps.')
+flags.DEFINE_boolean('random_walk_approx', False, 
+                     'If set, model will use random walk approx of T^k.')
+flags.DEFINE_integer('num_walks', 300, 
+                     'Number of walks to use in random walk approximation.')
+flags.DEFINE_integer('batch_size', 1024,
+                     'Batch size to use if using random walk approximation.')
 
 FLAGS = flags.FLAGS
 
@@ -100,6 +106,27 @@ def GetEncodedParams():
       'tr-%i' % FLAGS.num_train_nodes,
       'pows-%s' % FLAGS.adj_pows.replace(',', 'x').replace(':', '.'),
   ])
+
+
+class Batcher:
+  def __init__(self, data, batch_size, shuffle=True):
+    self.data = data
+    self.batch_size = batch_size
+    self.shuffle = shuffle
+  
+  def __iter__(self):
+    if self.shuffle:
+      self.idxs = numpy.random.permutation(len(self.data))
+    else:
+      self.idxs = numpy.arange(len(self.data))
+    num_batches = len(self.data) // self.batch_size
+    self.batches = numpy.split(self.idxs[:len(self.idxs)//self.batch_size*self.batch_size], num_batches)
+    return self
+
+  def __next__(self):
+    if len(self.batches) == 0:
+      raise StopIteration
+    return self.batches.pop(0)
 
 
 class AccuracyMonitor(object):
@@ -241,15 +268,33 @@ def main(unused_argv):
   ph_indices = tf.placeholder(tf.int64, [None])
   is_training = tf.placeholder_with_default(True, [], name='is_training')
 
-  pows_parser = AdjacencyPowersParser()  # Parses flag --adj_pows
+  power_parser = AdjacencyPowersParser()  # Parses flag --adj_pows
   num_x_entries = dataset.x_indices.shape[0]
 
   sparse_adj = dataset.sparse_adj_tensor()
   kernel_regularizer = CombinedRegularizer(FLAGS.l2reg, FLAGS.l2reg) #  keras_regularizers.l2(FLAGS.l2reg)
   
+  # Get indices of {train, validate, test} nodes.
+  num_train_nodes = None
+  if FLAGS.num_train_nodes > 0:
+    num_train_nodes = FLAGS.num_train_nodes
+  else:
+    num_train_nodes = -1 * FLAGS.num_train_nodes * dataset.ally.shape[1]
+  batch_size = FLAGS.batch_size if FLAGS.batch_size < num_train_nodes else num_train_nodes
+
+  train_indices, validate_indices, test_indices = dataset.get_partition_indices(
+      num_train_nodes, FLAGS.num_validate_nodes)
+
+  if FLAGS.random_walk_approx:
+    B = tf.placeholder(tf.int32, [batch_size])
+
   ### BUILD MODEL
   model = mixhop_model.MixHopModel(
-      sparse_adj, x, is_training, kernel_regularizer)
+      sparse_adj, x, is_training, kernel_regularizer,
+      adj_list=dataset.adj_list, degrees=dataset.degrees)
+  if FLAGS.random_walk_approx:
+      model.use_random_walk_approx(B, num_steps=max(power_parser.powers()),
+                                   num_sims=FLAGS.num_walks)
   if FLAGS.architecture:
     model.load_architecture_from_file(FLAGS.architecture)
   else:
@@ -258,9 +303,10 @@ def main(unused_argv):
     model.add_layer('tf', 'sparse_tensor_to_dense')
     model.add_layer('tf.nn', 'l2_normalize', axis=1)
    
-    power_parser = AdjacencyPowersParser()
+    import pdb; pdb.set_trace()
     layer_dims = list(map(int, FLAGS.hidden_dims_csv.split(',')))
     layer_dims.append(power_parser.output_capacity(dataset.ally.shape[1]))
+    layer_dims = [60]  # TODO: fix this
     for j, dim in enumerate(layer_dims):
       if j != 0:
         model.add_layer('tf.layers', 'dropout', FLAGS.layer_dropout,
@@ -277,7 +323,7 @@ def main(unused_argv):
   net = model.activations[-1]
 
   ### TRAINING.
-  sliced_output = tf.gather(net, ph_indices)
+  sliced_output = net if FLAGS.random_walk_approx else tf.gather(net, ph_indices)
   learn_rate = tf.placeholder(tf.float32, [], 'learn_rate')
 
   label_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
@@ -286,7 +332,7 @@ def main(unused_argv):
   loss = tf.losses.get_total_loss()
   
   if FLAGS.optimizer == 'MomentumOptimizer':
-    optimizer = tf.train.MomentumOptimizer(lr, 0.7, use_nesterov=True)
+    optimizer = tf.train.MomentumOptimizer(learn_rate, 0.7, use_nesterov=True)
   else:
     optimizer_class = getattr(tf.train, FLAGS.optimizer)
     optimizer = optimizer_class(learn_rate)
@@ -299,16 +345,6 @@ def main(unused_argv):
   sess.run(tf.global_variables_initializer())
  
   ### PREPARE FOR TRAINING
-  # Get indices of {train, validate, test} nodes.
-  num_train_nodes = None
-  if FLAGS.num_train_nodes > 0:
-    num_train_nodes = FLAGS.num_train_nodes
-  else:
-    num_train_nodes = -1 * FLAGS.num_train_nodes * dataset.ally.shape[1]
-
-  train_indices, validate_indices, test_indices = dataset.get_partition_indices(
-      num_train_nodes, FLAGS.num_validate_nodes)
-
   train_indices = range(num_train_nodes)
   feed_dict = {y: dataset.ally[train_indices]}
   dataset.populate_feed_dict(feed_dict)
@@ -319,30 +355,49 @@ def main(unused_argv):
   # accuracy_monitor to keep track of test accuracy and parameters @ best
   # validation accuracy
   def step(lr=None, columns=None):
-    if lr is not None:
-      feed_dict[learn_rate] = lr
-    i = LAST_STEP['step']
-    LAST_STEP['step'] += 1
-    feed_dict[is_training] = True
-    feed_dict[ph_indices] = train_indices
-    # Train step
-    train_preds, loss_value, _ = sess.run((sliced_output, label_loss, train_op), feed_dict)
+    batcher = Batcher(train_indices, batch_size)
+    train_accs = []
+    for batch in batcher:
+      feed_dict[B] = batch
+      if lr is not None:
+        feed_dict[learn_rate] = lr
+      i = LAST_STEP['step']
+      LAST_STEP['step'] += 1
+      feed_dict[is_training] = True
+      feed_dict[ph_indices] = batch if FLAGS.random_walk_approx else train_indices
+      # Train step
+      train_preds, loss_value, _ = sess.run((sliced_output, label_loss, train_op), feed_dict)
     
-    if numpy.isnan(loss_value).any():
-      print('NaN value reached. Debug please.')
-      import IPython; IPython.embed()
-    train_accuracy = numpy.mean(
-        train_preds.argmax(axis=1) == dataset.ally[train_indices].argmax(axis=1))
+      if numpy.isnan(loss_value).any():
+        print('NaN value reached. Debug please.')
+        import IPython; IPython.embed()
+      train_accuracy = numpy.mean(
+          train_preds.argmax(axis=1) == dataset.ally[train_indices].argmax(axis=1))
+      train_accs.append(train_accuracy)
+    train_accuracy = sum(train_accs) / len(train_accs)
     
-    feed_dict[is_training] = False
-    feed_dict[ph_indices] = test_indices
-    test_preds = sess.run(sliced_output, feed_dict)
-    test_accuracy = numpy.mean(
-        test_preds.argmax(axis=1) == dataset.ally[test_indices].argmax(axis=1))
-    feed_dict[ph_indices] = validate_indices
-    validate_preds = sess.run(sliced_output, feed_dict)
-    validate_accuracy = numpy.mean(
-        validate_preds.argmax(axis=1) == dataset.ally[validate_indices].argmax(axis=1))
+    test_accs = []
+    batcher = Batcher(test_indices, batch_size)
+    for batch in batcher:
+      feed_dict[B] = batch
+      feed_dict[is_training] = False
+      feed_dict[ph_indices] = batch
+      test_preds = sess.run(sliced_output, feed_dict)
+      test_accuracy = numpy.mean(
+          test_preds.argmax(axis=1) == dataset.ally[batch].argmax(axis=1))
+      test_accs.append(test_accuracy)
+    test_accuracy = sum(test_accs)/len(test_accs)
+
+    val_accs = []
+    batcher = Batcher(validate_indices, batch_size)
+    for batch in batcher:
+      feed_dict[B] = batch
+      feed_dict[ph_indices] = batch
+      validate_preds = sess.run(sliced_output, feed_dict)
+      validate_accuracy = numpy.mean(
+          validate_preds.argmax(axis=1) == dataset.ally[batch].argmax(axis=1))
+      val_accs.append(validate_accuracy)
+    validate_accuracy = sum(val_accs) / len(val_accs)
 
     keep_going = accuracy_monitor.mark_accuracy(validate_accuracy, test_accuracy, i)
 

@@ -43,7 +43,7 @@ def ReadDataset(dataset_dir, dataset_name):
   edge_lists = pickle.load(open(base_path + '.graph', 'rb'))
 
   allx = load_x(base_path + '.allx')
-  ally = numpy.array(numpy.load(base_path + '.ally'), dtype='float32')
+  ally = numpy.array(numpy.load(base_path + '.ally', allow_pickle=True), dtype='float32')
 
   # TODO(haija): Support Homophily Datasets [and upload them]
   if False: #FLAGS.homophily_dataset:
@@ -86,7 +86,7 @@ def ReadDataset(dataset_dir, dataset_name):
     test_idx_set = set(test_idx)
 
 
-    testy = numpy.array(numpy.load(base_path + '.ty'), dtype='float32')
+    testy = numpy.array(numpy.load(base_path + '.ty', allow_pickle=True), dtype='float32')
     ally = numpy.concatenate(
         [ally, numpy.zeros((num_test_examples, ally.shape[1]), dtype='float32')],
         0)
@@ -103,18 +103,24 @@ def ReadDataset(dataset_dir, dataset_name):
       edge_sets[n].add(node)  # Assume undirected.
 
   # Now, build adjacency list.
+  degrees = numpy.zeros((num_nodes,), dtype=numpy.int32)
   adj_indices = []
   adj_values = []
   for node, neighbors in edge_sets.items():
+    degrees[node] = len(neighbors)
     for n in neighbors:
       adj_indices.append((node, n))
       adj_values.append(1 / (numpy.sqrt(len(neighbors) * len(edge_sets[n]))))
+  adj_list = numpy.zeros((num_nodes, degrees.max()), dtype='int32')
+  for node, neighbors in edge_sets.items():
+    adj_list[node, :len(neighbors)] = numpy.array(list(neighbors))
 
   adj_indices = numpy.array(adj_indices, dtype='int32')
   adj_values = numpy.array(adj_values, dtype='float32')
   return Dataset(
       num_nodes=num_nodes, edge_sets=edge_sets, test_indices=test_idx,
-      adj_indices=adj_indices, adj_values=adj_values, allx=llallx, ally=ally)
+      adj_indices=adj_indices, adj_values=adj_values, allx=llallx, ally=ally,
+      degrees=degrees, adj_list=adj_list)
 
 
 class Dataset(object):
@@ -131,7 +137,8 @@ class Dataset(object):
   dataset.populate_feed_dict(feed_dict)  # makes adj and allx tensors runnable.
   """
   def __init__(self, allx=None, ally=None, num_nodes=None, test_indices=None,
-               edge_sets=None, adj_indices=None, adj_values=None):
+               edge_sets=None, adj_indices=None, adj_values=None, degrees=None,
+               adj_list=None):
     self.allx = allx
     self.ally = ally
     self.num_nodes = num_nodes
@@ -141,6 +148,8 @@ class Dataset(object):
     self.sp_adj_tensor = None
     self.sp_allx_tensor = None
     self.test_indices = test_indices
+    self.degrees = degrees
+    self.adj_list = adj_list
 
   def populate_feed_dict(self, feed_dict):
     """Adds the adjacency matrix and allx to placeholders."""

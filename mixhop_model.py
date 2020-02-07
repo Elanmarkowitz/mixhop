@@ -15,7 +15,8 @@ def sparse_dropout(x, drop_prob, num_entries, is_training):
 
 
 def psum_output_layer(x, num_classes):
-  num_segments = int(x.shape[1]) / num_classes
+  import pdb; pdb.set_trace()
+  num_segments = int(x.shape[1]) // num_classes
   if int(x.shape[1]) % num_classes != 0:
     print('Wasted psum capacity: %i out of %i' % (
         int(x.shape[1]) % num_classes, int(x.shape[1])))
@@ -30,6 +31,37 @@ def psum_output_layer(x, num_classes):
   return psum
 
 
+def random_walk_layer(B, adj_list, degree_matrix, num_steps, num_sims):
+  """Computes omega using random walks
+  
+  Omega has shape (batch size, k, num sims)
+  """
+  P = tf.tile(B, (num_sims,))
+  Ps = [P]
+  for i in range(num_steps):
+    x = tf.random.uniform((num_sims,))
+    x = tf.repeat(x, B.shape[0])
+    degrees = tf.gather(degree_matrix, P)
+    neighbor_indices = tf.cast(tf.floor(x*tf.cast(degrees, 'float32')), 'int32')
+    adj_indices = tf.transpose(tf.stack([P, neighbor_indices]))
+    P_ = tf.gather_nd(adj_list, adj_indices)
+    Ps.append(P_)
+    P = P_
+
+  return tf.reshape(tf.transpose(tf.stack(Ps)), (B.shape[0], num_steps + 1, num_sims))
+
+
+def random_walk_adj_times_x(x, omega, adj, degree_matrix, adj_pow=1):
+  """Computes (adj^adj_pow)*x using random walk matrix, omega"""
+  omega_k = omega[:, adj_pow, :]
+  omega_start = omega[:, 0, :]
+  x_omega = tf.gather(x, omega_k)
+  deg_v = tf.gather(degree_matrix, omega_k)
+  deg_u = tf.gather(degree_matrix, omega_start)
+  d = tf.cast((deg_u/deg_v)**0.5, 'float32')
+  return tf.reduce_mean(tf.expand_dims(d, -1) * x_omega, 1)
+
+
 def adj_times_x(adj, x, adj_pow=1):
   """Multiplies (adj^adj_pow)*x."""
   for i in range(adj_pow):
@@ -37,7 +69,8 @@ def adj_times_x(adj, x, adj_pow=1):
   return x
 
 def mixhop_layer(x, sparse_adjacency, adjacency_powers, dim_per_power,
-                 kernel_regularizer=None, layer_id=None, replica=None):
+                 kernel_regularizer=None, layer_id=None, replica=None,
+                 random_walk_omega=None, degree_matrix=None):
   """Constructs MixHop layer.
 
   Args:
@@ -52,8 +85,12 @@ def mixhop_layer(x, sparse_adjacency, adjacency_powers, dim_per_power,
   replica = replica or 0
   layer_id = layer_id or 0
   segments = []
+
   for p, dim in zip(adjacency_powers, dim_per_power):
-    net_p = adj_times_x(sparse_adjacency, x, p)
+    if random_walk_omega is None:
+      net_p = adj_times_x(sparse_adjacency, x, p)
+    else: 
+      net_p = random_walk_adj_times_x(x, random_walk_omega, sparse_adjacency, degree_matrix, p)
 
     with tf.variable_scope('r%i_l%i_p%s' % (replica, layer_id, str(p))):
       layer = tf.layers.Dense(
@@ -102,13 +139,17 @@ class MixHopModel(object):
   See example_pubmed_model() for reference.
   """
   
-  def __init__(self, sparse_adj, sparse_input, is_training, kernel_regularizer):
+  def __init__(self, sparse_adj, sparse_input, is_training, kernel_regularizer,
+               adj_list=None, degrees=None):
     self.is_training = is_training
     self.kernel_regularizer = kernel_regularizer 
     self.sparse_adj = sparse_adj
+    self.adj_list = adj_list
+    self.degrees = degrees
     self.sparse_input = sparse_input
     self.layer_defs = []
     self.activations = [sparse_input]
+    self.omega = None
 
   def save_architecture_to_file(self, filename):
     with open(filename, 'w') as fout:
@@ -157,11 +198,17 @@ class MixHopModel(object):
   def mixhop_layer(self, x, adjacency_powers, dim_per_power,
                    kernel_regularizer=None, layer_id=None, replica=None):
     return mixhop_layer(x, self.sparse_adj, adjacency_powers, dim_per_power,
-                        kernel_regularizer, layer_id, replica)
+                        kernel_regularizer, layer_id, replica, 
+                        random_walk_omega=self.omega, degree_matrix=self.degrees)
+
+  def use_random_walk_approx(self, B, num_steps=5, num_sims=300):
+    if self.adj_list is None or self.degrees is None:
+      raise Exception('Cannot do random walk approximation without adj_list and degrees.')
+    self.omega = random_walk_layer(B, self.adj_list, self.degrees, num_steps, num_sims)
 
 def example_pubmed_model(
     sparse_adj, x, num_x_entries, is_training, kernel_regularizer, input_dropout,
-    layer_dropout, num_classes=3):
+    layer_dropout, num_classes=3, random_walk_approx=False):
   """Returns PubMed model with test performance ~>80.4%.
   
   Args:
